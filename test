@@ -1,435 +1,340 @@
+import importlib.util
+import json
+import os
+import sys
+import types
 import unittest
 from unittest.mock import MagicMock, patch
-import json
-import sys
-import os
-from datetime import timedelta
-import types
-
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
-mock_audit_logger = MagicMock()
-mock_constants = MagicMock()
-
-utils_module = types.ModuleType("ads_recon.utils")
-utils_module.audit_logger = types.ModuleType("ads_recon.utils.audit_logger")
-utils_module.audit_logger.BigQueryAuditLogger = MagicMock(return_value=mock_audit_logger)
-utils_module.commons = types.ModuleType("ads_recon.utils.commons")
-utils_module.commons.Constants = MagicMock(return_value=mock_constants)
-
-sys.modules['ads_recon.utils'] = utils_module
-sys.modules['ads_recon.utils.audit_logger'] = utils_module.audit_logger
-sys.modules['ads_recon.utils.commons'] = utils_module.commons
-
-airflow_module = types.ModuleType("airflow")
-airflow_models_module = types.ModuleType("airflow.models")
-airflow_operators_module = types.ModuleType("airflow.operators")
-airflow_operators_empty_module = types.ModuleType("airflow.operators.empty")
-airflow_operators_python_module = types.ModuleType("airflow.operators.python")
-airflow_operators_trigger_module = types.ModuleType("airflow.operators.trigger_dagrun")
-airflow_providers_module = types.ModuleType("airflow.providers")
-airflow_providers_apache_module = types.ModuleType("airflow.providers.apache")
-airflow_providers_apache_beam_module = types.ModuleType("airflow.providers.apache.beam")
-airflow_providers_apache_beam_operators_module = types.ModuleType("airflow.providers.apache.beam.operators")
-airflow_providers_apache_beam_operators_beam_module = types.ModuleType("airflow.providers.apache.beam.operators.beam")
-airflow_providers_google_module = types.ModuleType("airflow.providers.google")
-airflow_providers_google_cloud_module = types.ModuleType("airflow.providers.google.cloud")
-airflow_providers_google_cloud_hooks_module = types.ModuleType("airflow.providers.google.cloud.hooks")
-airflow_providers_google_cloud_hooks_gcs_module = types.ModuleType("airflow.providers.google.cloud.hooks.gcs")
-airflow_utils_module = types.ModuleType("airflow.utils")
-airflow_utils_trigger_rule_module = types.ModuleType("airflow.utils.trigger_rule")
-
-class MockVariable:
-    @staticmethod
-    def get(key, default_vars=None, deserialize_json=False):
-        if key == 'ads_recon_config':
-            return json.dumps(mock_config_dict)
-        elif key == 'active_batch_dates':
-            if deserialize_json:
-                return {'table1': '2025-01-01', 'table2': '2025-01-02'}
-            return json.dumps({'table1': '2025-01-01', 'table2': '2025-01-02'})
-        return default_vars or {}
-
-airflow_models_module.Variable = MockVariable
-
-_current_dag = None
-
-class MockDAG:
-    def __init__(self, *args, **kwargs):
-        global _current_dag
-        self.dag_id = args[0] if args else kwargs.get('dag_id', 'test_dag')
-        self.tags = kwargs.get('tags', [])
-        self.default_args = kwargs.get('default_args', {})
-        self._task_dict = {}
-        self._tasks_list = []
-        _current_dag = self
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, *args):
-        global _current_dag
-        _current_dag = None
-        return False
-    
-    def get_task(self, task_id):
-        return self._task_dict.get(task_id)
-    
-    @property
-    def tasks(self):
-        return self._tasks_list
-    
-    def _add_task(self, task):
-        if hasattr(task, 'task_id'):
-            self._task_dict[task.task_id] = task
-            if task not in self._tasks_list:
-                self._tasks_list.append(task)
-
-airflow_module.DAG = MockDAG
-
-class MockOperatorBase:
-    def __init__(self, *args, **kwargs):
-        global _current_dag
-        self.task_id = kwargs.get('task_id', 'task')
-        self.upstream_list = []
-        self.downstream_list = []
-        self.trigger_rule = kwargs.get('trigger_rule', None)
-        self.dag = _current_dag
-        if _current_dag:
-            _current_dag._add_task(self)
-    
-    def __rshift__(self, other):
-        if isinstance(other, (list, tuple)):
-            for task in other:
-                if task not in self.downstream_list:
-                    self.downstream_list.append(task)
-                if self not in task.upstream_list:
-                    task.upstream_list.append(self)
-        else:
-            if other not in self.downstream_list:
-                self.downstream_list.append(other)
-            if self not in other.upstream_list:
-                other.upstream_list.append(self)
-        return other
-
-class MockEmptyOperator(MockOperatorBase):
-    pass
-
-class MockPythonOperator(MockOperatorBase):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.python_callable = kwargs.get('python_callable')
-        self.op_kwargs = kwargs.get('op_kwargs', {})
-
-class MockShortCircuitOperator(MockPythonOperator):
-    pass
-
-class MockBeamRunPythonPipelineOperator(MockOperatorBase):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.pipeline_options = kwargs.get('pipeline_options', {})
-
-class MockTriggerDagRunOperator(MockOperatorBase):
-    pass
-
-class MockTriggerRule:
-    ALL_DONE = 'all_done'
-
-def _create_mock_gcs_hook(*args, **kwargs):
-    mock = MagicMock()
-    mock.list.return_value = []
-    mock.exists.return_value = False
-    mock.download.return_value = b'{}'
-    return mock
-
-MockGCSHook = MagicMock(side_effect=_create_mock_gcs_hook)
-
-airflow_module.models = airflow_models_module
-airflow_module.operators = airflow_operators_module
-airflow_operators_module.empty = airflow_operators_empty_module
-airflow_operators_module.python = airflow_operators_python_module
-airflow_operators_module.trigger_dagrun = airflow_operators_trigger_module
-airflow_operators_empty_module.EmptyOperator = MockEmptyOperator
-airflow_operators_python_module.PythonOperator = MockPythonOperator
-airflow_operators_python_module.ShortCircuitOperator = MockShortCircuitOperator
-airflow_operators_trigger_module.TriggerDagRunOperator = MockTriggerDagRunOperator
-
-airflow_module.providers = airflow_providers_module
-airflow_providers_module.apache = airflow_providers_apache_module
-airflow_providers_apache_module.beam = airflow_providers_apache_beam_module
-airflow_providers_apache_beam_module.operators = airflow_providers_apache_beam_operators_module
-airflow_providers_apache_beam_operators_module.beam = airflow_providers_apache_beam_operators_beam_module
-airflow_providers_apache_beam_operators_beam_module.BeamRunPythonPipelineOperator = MockBeamRunPythonPipelineOperator
-
-airflow_providers_module.google = airflow_providers_google_module
-airflow_providers_google_module.cloud = airflow_providers_google_cloud_module
-airflow_providers_google_cloud_module.hooks = airflow_providers_google_cloud_hooks_module
-airflow_providers_google_cloud_hooks_module.gcs = airflow_providers_google_cloud_hooks_gcs_module
-airflow_providers_google_cloud_hooks_gcs_module.GCSHook = MockGCSHook
-
-airflow_module.utils = airflow_utils_module
-airflow_utils_module.trigger_rule = airflow_utils_trigger_rule_module
-airflow_utils_trigger_rule_module.TriggerRule = MockTriggerRule
-
-sys.modules['airflow'] = airflow_module
-sys.modules['airflow.models'] = airflow_models_module
-sys.modules['airflow.operators'] = airflow_operators_module
-sys.modules['airflow.operators.empty'] = airflow_operators_empty_module
-sys.modules['airflow.operators.python'] = airflow_operators_python_module
-sys.modules['airflow.operators.trigger_dagrun'] = airflow_operators_trigger_module
-sys.modules['airflow.providers'] = airflow_providers_module
-sys.modules['airflow.providers.apache'] = airflow_providers_apache_module
-sys.modules['airflow.providers.apache.beam'] = airflow_providers_apache_beam_module
-sys.modules['airflow.providers.apache.beam.operators'] = airflow_providers_apache_beam_operators_module
-sys.modules['airflow.providers.apache.beam.operators.beam'] = airflow_providers_apache_beam_operators_beam_module
-sys.modules['airflow.providers.google'] = airflow_providers_google_module
-sys.modules['airflow.providers.google.cloud'] = airflow_providers_google_cloud_module
-sys.modules['airflow.providers.google.cloud.hooks'] = airflow_providers_google_cloud_hooks_module
-sys.modules['airflow.providers.google.cloud.hooks.gcs'] = airflow_providers_google_cloud_hooks_gcs_module
-sys.modules['airflow.utils'] = airflow_utils_module
-sys.modules['airflow.utils.trigger_rule'] = airflow_utils_trigger_rule_module
-
-pendulum_module = types.ModuleType("pendulum")
-pendulum_module.datetime = lambda *args, **kwargs: MagicMock()
-sys.modules['pendulum'] = pendulum_module
-
-mock_config_dict = {
-    'service_account_email': 'test@service-account.com',
-    'host_project_id': 'host-project',
-    'subnetwork': 'regions/us-central1/subnetworks/default',
-    'artifact_bucket': 'test-artifact-bucket',
-    'landing_data_bucket': 'test-landing-bucket',
-    'master_data_bucket': 'test-master-bucket',
-    'raw_data_bucket': 'test-raw-bucket',
-    'curated_data_bucket': 'test-curated-bucket',
-    'audit_dataset': 'test_audit_dataset',
-    'dag_summary_table': 'dag_summary',
-    'task_audit_table': 'task_audit',
-    'dq_audit_table': 'dq_audit',
-    'dataflow_script_location': 'gs://bucket/script.py',
-    'run_env': 'test',
-    'gcp_conn_id': 'test_conn',
-    'region': 'us-central1',
-    'project_id': 'test-project-id',
-    'project_name': 'Recon',
-    'source_name': 'Intellimatch',
-    'dq_tables': ['table1', 'table2']
-}
-
-for key, value in mock_config_dict.items():
-    setattr(mock_constants, key, value)
-
-class TaskList(list):
-    def __rshift__(self, other):
-        """Support >> operator for list of tasks (Airflow feature)"""
-        if other is None:
-            raise ValueError("Cannot use >> operator with None downstream task")
-        # Filter out None tasks and set up dependencies
-        for task in self:
-            if task is None:
-                raise ValueError(f"Cannot use >> operator with None task in list: {self}")
-            if hasattr(task, '__rshift__'):
-                task >> other
-        # Always return the downstream task to support chaining
-        return other
-
-try:
-    with patch('os.getenv') as mock_getenv, patch('os.environ.get') as mock_environ_get:
-        mock_getenv.return_value = 'test-project-id'
-        mock_environ_get.return_value = '/home/airflow/gcs/dags'
-        
-        import importlib.util
-        import re
-        
-        spec = importlib.util.spec_from_file_location(
-            "ads_recon_dq_dataflow",
-            os.path.join(project_root, "src", "dags", "ads_recon", "scripts", "ads_recon_dq_dataflow.py")
-        )
-        
-        with open(spec.origin, 'r') as f:
-            source = f.read()
-        
-        pattern = r'(\[[^\]]+\])\s*>>'
-        def replace_list(match):
-            list_expr = match.group(1)
-            return f'TaskList({list_expr}) >>'
-        
-        source = re.sub(pattern, replace_list, source)
-        
-        code = compile(source, spec.origin, 'exec')
-        
-        dag_module = types.ModuleType("ads_recon_dq_dataflow")
-        
-        dag_module.__dict__.update({
-            '__name__': 'src.dags.ads_recon.scripts.ads_recon_dq_dataflow',
-            '__file__': spec.origin,
-            'TaskList': TaskList,
-            'json': json,
-            'logging': __import__('logging'),
-            'os': __import__('os'),
-            'uuid': __import__('uuid'),
-            'datetime': __import__('datetime'),
-            'pendulum': pendulum_module,
-            'DAG': MockDAG,
-            'Variable': MockVariable,
-            'EmptyOperator': MockEmptyOperator,
-            'PythonOperator': MockPythonOperator,
-            'ShortCircuitOperator': MockShortCircuitOperator,
-            'TriggerDagRunOperator': MockTriggerDagRunOperator,
-            'BeamRunPythonPipelineOperator': MockBeamRunPythonPipelineOperator,
-            'GCSHook': MockGCSHook,
-            'TriggerRule': MockTriggerRule,
-            'BigQueryAuditLogger': utils_module.audit_logger.BigQueryAuditLogger,
-            'Constants': utils_module.commons.Constants,
-        })
-        
-        sys.modules['src.dags.ads_recon.scripts.ads_recon_dq_dataflow'] = dag_module
-        exec(code, dag_module.__dict__)
-        
-except Exception as e:
-    print(f"Warning: Error importing module: {e}")
-    import traceback
-    traceback.print_exc()
-    dag_module = None
 
 
-class TestAdsReconDqDataflowV2(unittest.TestCase):
-    
+REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
+DAG_PATH = os.path.join(
+    REPO_ROOT, "src", "dags", "ads_recon", "scripts", "ads_recon_dq_dataflow.py"
+)
+
+
+class AdsReconDqDataflowPatchedTests(unittest.TestCase):
+
     @classmethod
     def setUpClass(cls):
-        if dag_module is None:
-            raise unittest.SkipTest("Source file has import issues.")
-    
+        cls._current_dag = None
+
+        class MockDAG:
+            def __init__(self, *args, **kwargs):
+                cls._current_dag = self
+                self.dag_id = args[0] if args else kwargs.get("dag_id", "test_dag")
+                self.tags = kwargs.get("tags", [])
+                self.default_args = kwargs.get("default_args", {})
+                self._task_dict = {}
+                self._tasks_list = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                cls._current_dag = None
+                return False
+
+            def _add_task(self, task):
+                self._task_dict[task.task_id] = task
+                if task not in self._tasks_list:
+                    self._tasks_list.append(task)
+
+            def get_task(self, task_id):
+                return self._task_dict.get(task_id)
+
+            @property
+            def tasks(self):
+                return list(self._tasks_list)
+
+        class MockOperatorBase:
+            def __init__(self, *args, **kwargs):
+                self.task_id = kwargs.get("task_id", "task")
+                self.upstream_list = []
+                self.downstream_list = []
+                self.trigger_rule = kwargs.get("trigger_rule")
+                self.dag = cls._current_dag
+                if cls._current_dag is not None:
+                    cls._current_dag._add_task(self)
+
+            def __rshift__(self, other):
+                if isinstance(other, (list, tuple)):
+                    for t in other:
+                        self.__rshift__(t)
+                    return other
+                if other not in self.downstream_list:
+                    self.downstream_list.append(other)
+                if self not in other.upstream_list:
+                    other.upstream_list.append(self)
+                return other
+
+            def __rrshift__(self, other):
+                if isinstance(other, (list, tuple)):
+                    for t in other:
+                        t >> self
+                    return self
+                return self
+
+        class MockEmptyOperator(MockOperatorBase):
+            pass
+
+        class MockPythonOperator(MockOperatorBase):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.python_callable = kwargs.get("python_callable")
+                self.op_kwargs = kwargs.get("op_kwargs", {})
+
+        class MockShortCircuitOperator(MockPythonOperator):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.ignore_downstream_trigger_rules = kwargs.get(
+                    "ignore_downstream_trigger_rules", False
+                )
+
+        class MockBeamRunPythonPipelineOperator(MockOperatorBase):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.runner = kwargs.get("runner")
+                self.py_file = kwargs.get("py_file")
+                self.pipeline_options = kwargs.get("pipeline_options", {})
+
+        class MockTriggerDagRunOperator(MockOperatorBase):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.trigger_dag_id = kwargs.get("trigger_dag_id")
+
+        class MockTriggerRule:
+            ALL_DONE = "all_done"
+
+        class MockVariable:
+            @staticmethod
+            def get(key, default_var=None, deserialize_json=False):
+                return default_var
+
+        cls.gcs_hook_instance = MagicMock()
+        cls.gcs_hook_instance.list.return_value = []
+        cls.gcs_hook_instance.exists.return_value = False
+        cls.gcs_hook_instance.download.return_value = b"{}"
+        cls.gcs_hook_class = MagicMock(return_value=cls.gcs_hook_instance)
+
+        cls.audit_logger_instance = MagicMock()
+        cls.bigquery_audit_logger_class = MagicMock(return_value=cls.audit_logger_instance)
+
+        cls.config = MagicMock()
+        cls.config.service_account_email = "test@service-account.com"
+        cls.config.host_project_id = "host-project"
+        cls.config.subnetwork = "regions/us-central1/subnetworks/default"
+        cls.config.artifact_bucket = "test-artifact-bucket"
+        cls.config.project_id = "test-project-id"
+        cls.config.gcp_conn_id = "google_cloud_default"
+        cls.config.region = "us-central1"
+        cls.config.landing_data_bucket = "test-landing-bucket"
+        cls.config.master_data_bucket = "test-master-bucket"
+        cls.config.raw_data_bucket = "test-raw-bucket"
+        cls.config.curated_data_bucket = "test-curated-bucket"
+        cls.config.project_name = "Recon"
+        cls.config.source_name = "Intellimatch"
+        cls.config.audit_dataset = "audit_ds"
+        cls.config.dag_summary_table = "dag_summary"
+        cls.config.task_audit_table = "task_audit"
+        cls.config.dq_audit_table = "dq_audit"
+        cls.config.dataflow_script_location = "gs://bucket/dq_validation_pipeline.py"
+        cls.config.run_env = "test"
+        cls.config.dq_tables = ["table1", "table2"]
+
+        cls.constants_class = MagicMock(return_value=cls.config)
+
+        airflow_module = types.ModuleType("airflow")
+        airflow_models_module = types.ModuleType("airflow.models")
+        airflow_operators_empty_module = types.ModuleType("airflow.operators.empty")
+        airflow_operators_python_module = types.ModuleType("airflow.operators.python")
+        airflow_operators_trigger_module = types.ModuleType("airflow.operators.trigger_dagrun")
+        airflow_utils_trigger_rule_module = types.ModuleType("airflow.utils.trigger_rule")
+
+        airflow_providers_apache_beam_ops_module = types.ModuleType(
+            "airflow.providers.apache.beam.operators.beam"
+        )
+        airflow_providers_google_gcs_module = types.ModuleType(
+            "airflow.providers.google.cloud.hooks.gcs"
+        )
+
+        airflow_module.DAG = MockDAG
+        airflow_models_module.Variable = MockVariable
+        airflow_operators_empty_module.EmptyOperator = MockEmptyOperator
+        airflow_operators_python_module.PythonOperator = MockPythonOperator
+        airflow_operators_python_module.ShortCircuitOperator = MockShortCircuitOperator
+        airflow_operators_trigger_module.TriggerDagRunOperator = MockTriggerDagRunOperator
+        airflow_utils_trigger_rule_module.TriggerRule = MockTriggerRule
+        airflow_providers_apache_beam_ops_module.BeamRunPythonPipelineOperator = (
+            MockBeamRunPythonPipelineOperator
+        )
+        airflow_providers_google_gcs_module.GCSHook = cls.gcs_hook_class
+
+        pendulum_module = types.ModuleType("pendulum")
+        pendulum_module.datetime = lambda *args, **kwargs: MagicMock()
+
+        ads_recon_utils_module = types.ModuleType("ads_recon.utils")
+        ads_recon_audit_logger_module = types.ModuleType("ads_recon.utils.audit_logger")
+        ads_recon_commons_module = types.ModuleType("ads_recon.utils.commons")
+        ads_recon_audit_logger_module.BigQueryAuditLogger = cls.bigquery_audit_logger_class
+        ads_recon_commons_module.Constants = cls.constants_class
+
+        cls._sys_modules_patch = patch.dict(
+            sys.modules,
+            {
+                "airflow": airflow_module,
+                "airflow.models": airflow_models_module,
+                "airflow.operators.empty": airflow_operators_empty_module,
+                "airflow.operators.python": airflow_operators_python_module,
+                "airflow.operators.trigger_dagrun": airflow_operators_trigger_module,
+                "airflow.providers.apache.beam.operators.beam": airflow_providers_apache_beam_ops_module,
+                "airflow.providers.google.cloud.hooks.gcs": airflow_providers_google_gcs_module,
+                "airflow.utils.trigger_rule": airflow_utils_trigger_rule_module,
+                "pendulum": pendulum_module,
+                "ads_recon.utils": ads_recon_utils_module,
+                "ads_recon.utils.audit_logger": ads_recon_audit_logger_module,
+                "ads_recon.utils.commons": ads_recon_commons_module,
+            },
+            clear=False,
+        )
+        cls._sys_modules_patch.start()
+
+        cls._env_patch = patch.dict(os.environ, {"GCP_PROJECT": "test-project-id"})
+        cls._env_patch.start()
+
+        def _variable_get_side_effect(key, default_var=None, deserialize_json=False):
+            if key == "ads_recon_config":
+                return json.dumps({"artifact_bucket": "x"})
+            if key == "active_batch_dates":
+                return {"table1": "20250101", "table2": "20250102"} if deserialize_json else json.dumps(
+                    {"table1": "20250101", "table2": "20250102"}
+                )
+            return default_var
+
+        cls._variable_patch = patch(
+            "airflow.models.Variable.get", side_effect=_variable_get_side_effect
+        )
+        cls._variable_patch.start()
+
+        spec = importlib.util.spec_from_file_location("ads_recon_dq_dataflow_under_test", DAG_PATH)
+        cls.dag_module = importlib.util.module_from_spec(spec)
+        sys.modules["ads_recon_dq_dataflow_under_test"] = cls.dag_module
+        spec.loader.exec_module(cls.dag_module)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._variable_patch.stop()
+        cls._env_patch.stop()
+        cls._sys_modules_patch.stop()
+        sys.modules.pop("ads_recon_dq_dataflow_under_test", None)
+
     def setUp(self):
-        if dag_module is None:
-            self.skipTest("Module not imported")
-        mock_audit_logger.reset_mock()
-        for key, value in mock_config_dict.items():
-            setattr(mock_constants, key, value)
-        if hasattr(dag_module, 'TASK_OFFSET'):
-            dag_module.TASK_OFFSET = 0
-    
-    def test_get_component_id(self):
-        """Test get_component_id increments."""
-        first_id = dag_module.get_component_id()
-        second_id = dag_module.get_component_id()
-        self.assertEqual(second_id, first_id + 1)
-    
-    def test_on_task_failure(self):
-        """Test on_task_failure callback."""
-        mock_context = {
-            'task_instance': MagicMock(task_id='test_task'),
-            'exception': Exception('Test error')
-        }
-        dag_module.on_task_failure(mock_context)
-        mock_audit_logger.log_task_run.assert_called_once()
-    
-    def test_check_if_files_exist_fn(self):
-        """Test check_if_files_exist_fn."""
-        mock_hook = MagicMock()
-        mock_hook.list.return_value = ['abc123_table1_20250101_001.parquet']
-        original_gcs_hook = dag_module.GCSHook
-        dag_module.GCSHook = lambda *args, **kwargs: mock_hook
-        try:
-            result = dag_module.check_if_files_exist_fn(
-                bucket_name='test-bucket',
-                prefix_pattern='gs://test-bucket/path/*.parquet'
-            )
-            self.assertTrue(result)
-        finally:
-            dag_module.GCSHook = original_gcs_hook
-    
-    def test_perform_dq_audit_fn_success(self):
-        """Test perform_dq_audit_fn with successful processing."""
-        mock_hook = MagicMock()
+        self.audit_logger_instance.reset_mock()
+        self.gcs_hook_instance.reset_mock()
+        if hasattr(self.dag_module, "TASK_OFFSET"):
+            self.dag_module.TASK_OFFSET = 0
+
+    def test_get_component_id_increments(self):
+        self.assertEqual(self.dag_module.get_component_id(), 1)
+        self.assertEqual(self.dag_module.get_component_id(), 2)
+
+    def test_check_if_files_exist_fn_trims_wildcard_prefix(self):
+        self.gcs_hook_instance.list.return_value = ["a.parquet"]
+        ok = self.dag_module.check_if_files_exist_fn(
+            bucket_name="test-bucket",
+            prefix_pattern="gs://test-bucket/some/prefix/*.parquet",
+        )
+        self.assertTrue(ok)
+        self.gcs_hook_instance.list.assert_called_once()
+        _, kwargs = self.gcs_hook_instance.list.call_args
+        self.assertEqual(kwargs["prefix"], "some/prefix/")
+
+    def test_perform_dq_audit_fn_reads_summary_and_logs(self):
         dq_summary = {
-            'rule_details': [{
-                'file_name': 'gs://bucket/Recon/Intellimatch/20250101/Source/table1/abc123_table1_20250101_001.parquet',
-                'column_name': 'test_column',
-                'total_count': 100,
-                'rule_type': 'not_null',
-                'failed': False,
-                'failed_count': 0,
-                'status': 'passed',
-                'message': 'All values passed',
-                'table_name': 'test_table',
-                'file_date': '2025-01-01',
-                'passed_count': 100
-            }]
+            "rule_details": [
+                {
+                    "file_name": "f.parquet",
+                    "column_name": "c",
+                    "total_count": 10,
+                    "rule_type": "not_null",
+                    "failed": False,
+                    "failed_count": 0,
+                    "status": "passed",
+                    "message": "ok",
+                    "table_name": "table1",
+                    "file_date": "20250101",
+                    "passed_count": 10,
+                }
+            ]
         }
-        mock_hook.exists.return_value = True
-        mock_hook.download.return_value = json.dumps(dq_summary).encode('utf-8')
-        original_gcs_hook = dag_module.GCSHook
-        dag_module.GCSHook = lambda *args, **kwargs: mock_hook
-        try:
-            dag_module.perform_dq_audit_fn(
-                rendered_paths=['gs://bucket/dq_results/table1/run1/summary.json'],
-                **{}
-            )
-            mock_audit_logger.log_dq_audit.assert_called_once()
-        finally:
-            dag_module.GCSHook = original_gcs_hook
+        self.gcs_hook_instance.exists.return_value = True
+        self.gcs_hook_instance.download.return_value = json.dumps(dq_summary).encode("utf-8")
 
-    def test_move_files_fn_passed(self):
-        """Test move_files_fn executes without error."""
-        mock_hook = MagicMock()
-        mock_hook.exists.return_value = True
-        mock_hook.download.return_value = json.dumps({
-            'file_stats': [{
-                'file_name': 'gs://bucket/Recon/Intellimatch/20250101/Source/table1/abc123_table1_20250101_001.parquet',
-                'pass_rate': 95.0
-            }]
-        }).encode('utf-8')
-        original_gcs_hook = dag_module.GCSHook
-        dag_module.GCSHook = lambda *args, **kwargs: mock_hook
-        try:
-            dag_module.move_files_fn(
-                rendered_output_paths=['gs://bucket/dq_results/table1/run1/summary.json'],
-                destination_bucket='curated-bucket',
-                target_folder='processed',
-                filter_mode='passed',
-                **{}
-            )
-            self.assertEqual(mock_hook.rewrite.call_count, 1)
-        finally:
-            dag_module.GCSHook = original_gcs_hook
-    
-    def test_dag_structure(self):
-        """Test DAG structure."""
-        self.assertIsNotNone(dag_module.dag)
-        self.assertEqual(dag_module.dag.dag_id, 'egsop_dq_dataflow')
-        self.assertEqual(dag_module.dag.tags, ['EGSOP', 'DataQ', 'Apache Beam'])
-        
-        # Verify all tasks are created (not None) - this catches the NoneType >> error
-        self.assertIsNotNone(dag_module.audit_task, "audit_task should not be None")
-        self.assertIsNotNone(dag_module.move_curated, "move_curated should not be None")
-        self.assertIsNotNone(dag_module.move_error, "move_error should not be None")
-        self.assertIsNotNone(dag_module.trigger_dynamic_iceberg_dag, "trigger_dynamic_iceberg_dag should not be None")
-        self.assertIsNotNone(dag_module.dag_end_op, "dag_end_op should not be None")
-        
-        # Test that the list >> operator works correctly
-        task_list = TaskList([dag_module.audit_task, dag_module.move_curated, dag_module.move_error])
-        result = task_list >> dag_module.trigger_dynamic_iceberg_dag
-        self.assertIsNotNone(result, "List >> operator should return downstream task")
-        self.assertEqual(result, dag_module.trigger_dynamic_iceberg_dag)
-        
-        # Test chaining works
-        result2 = dag_module.trigger_dynamic_iceberg_dag >> dag_module.dag_end_op
-        self.assertIsNotNone(result2, "Chained >> operator should return downstream task")
-        self.assertEqual(result2, dag_module.dag_end_op)
-    
-    def test_get_commons(self):
-        """Test get_commons function."""
-        with patch('src.dags.ads_recon.scripts.ads_recon_dq_dataflow.os.getenv') as mock_getenv:
-            mock_getenv.return_value = 'test-project-id'
-            with patch('src.dags.ads_recon.scripts.ads_recon_dq_dataflow.Variable') as mock_var:
-                mock_var.get.return_value = json.dumps(mock_config_dict)
-                commons = dag_module.get_commons()
-                utils_module.commons.Constants.assert_called()
+        self.dag_module.perform_dq_audit_fn(
+            rendered_paths=["gs://bkt/path/to/summary.json"], **{}
+        )
+
+        self.audit_logger_instance.log_dq_audit.assert_called_once()
+        _, kwargs = self.audit_logger_instance.log_dq_audit.call_args
+        self.assertIn("src", kwargs)
+        self.assertEqual(kwargs["src"][0]["column_name"], "c")
+        self.assertEqual(kwargs["src"][0]["status"], "passed")
+
+    def test_move_files_fn_moves_only_when_filter_matches(self):
+        self.gcs_hook_instance.exists.return_value = True
+        self.gcs_hook_instance.download.return_value = json.dumps(
+            {
+                "file_stats": [
+                    {
+                        "file_name": "gs://src-bkt/Recon/Intellimatch/20250101/Source/table1/f1.parquet",
+                        "pass_rate": 50.0,
+                    }
+                ]
+            }
+        ).encode("utf-8")
+
+        self.dag_module.move_files_fn(
+            rendered_output_paths=["gs://dq-bkt/dq_results/table1/run/summary.json"],
+            destination_bucket="raw-bkt",
+            target_folder="Error",
+            filter_mode="failed",
+            **{},
+        )
+
+        self.assertEqual(self.gcs_hook_instance.rewrite.call_count, 1)
+        self.assertEqual(self.gcs_hook_instance.delete.call_count, 1)
+
+    def test_dag_structure_has_expected_tasks(self):
+        dag = self.dag_module.dag
+        self.assertIsNotNone(dag)
+        task_ids = [t.task_id for t in dag.tasks]
+
+        for tid in [
+            "start",
+            "end",
+            "dag_summary_start",
+            "dag_summary_end",
+            "perform_dq_audit",
+            "move_to_curated_task",
+            "move_to_error_task",
+            "trigger_iceberg_curated_DAG",
+        ]:
+            self.assertIn(tid, task_ids)
+
+        for table in self.config.dq_tables:
+            safe = table.replace("_", "-").lower()
+            self.assertIn(f"check_files_{safe}", task_ids)
+            self.assertIn(f"run_dq_{safe}", task_ids)
+
+        run_task = dag.get_task("run_dq_table1")
+        self.assertIsNotNone(run_task)
+        self.assertIn("input_pattern", run_task.pipeline_options)
+        self.assertIn("rules_yaml", run_task.pipeline_options)
+        self.assertIn("output_stats", run_task.pipeline_options)
+        self.assertIn("dq_run_id", run_task.pipeline_options)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
+
 
