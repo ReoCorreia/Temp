@@ -1,0 +1,473 @@
+import argparse
+import json
+import logging
+import yaml
+from datetime import datetime
+from typing import Any, Dict, List, Tuple
+
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions
+from apache_beam.io.filesystems import FileSystems
+from apache_beam.pvalue import AsSingleton
+import pandas as pd
+import pyarrow.parquet as pq
+
+
+class DataQualityValidator:
+    def __init__(self, dataframe: pd.DataFrame):
+        self.df = dataframe
+
+    def validate(self, expectation_type: str, **kwargs) -> Dict[str, int]:
+        mapping = {
+            "expect_column_values_to_not_be_null": self._check_not_null,
+            "expect_column_values_to_be_null": self._check_null,
+            "expect_column_values_to_be_blank": self._check_blank,
+            "expect_column_values_to_not_be_blank": self._check_not_blank,
+            "expect_column_values_to_not_be_null_or_blank": self._check_not_null_or_blank,
+            "expect_column_value_lengths_to_be_between": self._check_length_between,
+            "expect_column_values_to_match_regex": self._check_regex,
+            "expect_column_values_to_not_match_regex": self._check_not_regex,
+            "expect_column_values_to_be_in_set": self._check_in_set,
+            "expect_column_values_to_not_be_in_set": self._check_not_in_set,
+            "expect_column_values_to_be_between": self._check_between,
+            "expect_column_values_to_be_unique": self._check_unique,
+            "expect_column_values_when_condition": self._check_conditional_value,
+            "expect_column_values_calculate_value": self._check_calculates_value,
+            "expect_column_values_to_match_strftime_format": self._check_striftime_format,
+        }
+        
+        func = mapping.get(expectation_type)
+        if not func:
+            return {"total": len(self.df), "failed": 0}
+        
+        return func(**kwargs)
+
+    def _base(self, mask: pd.Series) -> Dict[str, int]:
+        return {"total": int(mask.size), "failed": int(mask.sum())}
+
+    def _check_not_null(self, column, **kwargs):
+        return self._base(self.df[column].isnull())
+
+    def _check_null(self, column, **kwargs):
+        return self._base(self.df[column].notnull())
+
+    def _check_blank(self, column, **kwargs):
+        return self._base(self.df[column].astype(str).str.strip() != "")
+
+    def _check_not_blank(self, column, **kwargs):
+        return self._base(self.df[column].astype(str).str.strip() == "")
+
+    def _check_not_null_or_blank(self, column, **kwargs):
+        is_null = self.df[column].isnull()
+        is_blank = self.df[column].astype(str).str.strip() == ""
+        mask = is_null | is_blank
+        return self._base(mask)
+
+    def _check_length_between(self, column, min_value=0, max_value=None, **kwargs):
+        lens = self.df[column].dropna().astype(str).str.len()
+        mask = (lens < min_value)
+        if max_value is not None:
+            mask |= (lens > max_value)
+        res = self._base(mask)
+        res['total'] = len(self.df) 
+        return res
+
+    def _check_regex(self, column, regex, **kwargs):
+        return self._base(~self.df[column].astype(str).str.match(regex))
+
+    def _check_not_regex(self, column, regex, **kwargs):
+        return self._base(self.df[column].astype(str).str.match(regex))
+
+    def _check_in_set(self, column, value_set, **kwargs):
+        return self._base(~self.df[column].isin(value_set))
+
+    def _check_not_in_set(self, column, value_set, **kwargs):
+        return self._base(self.df[column].isin(value_set))
+
+    def _check_between(self, column, min_value=None, max_value=None, **kwargs):
+        s = self.df[column]
+        mask = pd.Series(False, index=s.index)
+        if min_value is not None: mask |= (s < min_value)
+        if max_value is not None: mask |= (s > max_value)
+        return self._base(mask)
+        
+    def _check_unique(self, column, **kwargs):
+        return self._base(self.df[column].duplicated(keep=False))
+
+    def _check_conditional_value(self, column, conditional_column, condition_value, expected_value, **kwargs):
+        
+        def normalize_value(val): 
+            try:
+                num_val = pd. to_numeric (val, errors='coerce')
+                if pd.isna(num_val):
+                    return 'nan'
+
+                if num_val == int(num_val):
+                    return str(int(num_val))
+                return str(num_val)
+            except:
+                return str(val)
+
+        condition_column = self.df [conditional_column].apply(normalize_value)
+        cond_val = normalize_value(condition_value)
+        condition_mask = condition_column == cond_val
+
+        if condition_mask.sum() == 0:
+            return {"total": 0, "failed": 0}
+
+        check_col = self.df[column].apply(normalize_value)
+        exp_val = normalize_value(expected_value)
+        failure_mask = condition_mask & (check_col != exp_val)
+
+        res = self._base(failure_mask)
+        res['total'] = int(condition_mask.sum())
+        return res
+
+    def _check_calculates_value(self, column, multiplyDivideInd_column, amount_column, exchangeRate_column, **kwargs):
+        divide_mask = self.df[multiplyDivideInd_column] == 'D'
+
+        calculated = pd.Series(index=self.df.index, dtype=float)
+        calculated[divide_mask] = self.df.loc[divide_mask, amount_column] / self.df.loc[divide_mask, exchangeRate_column]
+        calculated[~divide_mask] = self.df.loc[~divide_mask, amount_column] * self.df.loc[~divide_mask, exchangeRate_column]
+
+        calculated_rounded = calculated.round(2)
+        eqAmount_rounded = self.df[column].round(2)
+
+        return self._base(calculated_rounded != eqAmount_rounded)
+
+    def _check_striftime_format(self, column, format, **kwargs):
+        
+        def validate_format(val):
+            try:
+                if pd.isna(val):
+                    return True 
+
+                if isinstance(val, (pd.Timestamp, datetime)):
+                    formatted = val.strftime(format)
+                    datetime.strptime(formatted, format)
+                    return False  
+                else:
+                    datetime.strptime(str(val), format)
+                    return False  
+
+            except (ValueError, TypeError, AttributeError):
+                return True 
+        
+        s = self.df[column]
+        mask = s.apply(validate_format)
+        return self._base(mask)
+
+class ExpandPattern(beam.DoFn):
+    def process(self, pattern):
+        match_results = FileSystems.match([pattern])
+        for match_result in match_results:
+            for metadata in match_result.metadata_list:
+                yield metadata.path
+
+
+class GetParquetRowGroups(beam.DoFn):
+    def process(self, file_path):
+        try:
+            pf = pq.ParquetFile(file_path)
+            for i in range(pf.num_row_groups):
+                yield (file_path, i)
+        except Exception as e:
+            logging.error(f"Metadata read failed for {file_path}: {e}")
+
+
+class ValidateRowGroup(beam.DoFn):
+    def __init__(self, table_name_args=None):
+        self.table_name_args = table_name_args
+
+    def _get_target_table_and_columns(self, tables):
+         
+        if self.table_name_args:
+            target_table = self.table_name_args
+        else:
+            if not tables:
+                logging.error("DIAGNOSTIC FAIL: 'tables' key is empty in YAML.")
+                return None, None
+            target_table = list(tables.keys())[0]
+
+        if target_table not in tables:
+            logging.error(f"DIAGNOSTIC FAIL: Target table '{target_table}' not in YAML keys {list(tables.keys())}")
+            return None, None
+
+        columns_config = tables[target_table].get('columns', {})
+        if not columns_config:
+            logging.error(f"DIAGNOSTIC FAIL: No 'columns' found under table '{target_table}'")
+            return None, None
+
+        return target_table, columns_config
+
+    def _validate_column_exists(self, column, df_columns):
+        """Check if column exists in dataframe and log appropriate message."""
+        if column in df_columns:
+            return True
+        
+        lower_cols = [c.lower() for c in df_columns]
+        msg = f"SKIPPING '{column}': Not found in Parquet."
+        if column.lower() in lower_cols:
+            msg += f" (Hint: Case mismatch detected! Found '{column.lower()}' in File)"
+        logging.info(msg)
+        return False
+
+    def _parse_rule(self, rule, column):
+        """Parse a rule (str or dict) into rule type and kwargs."""
+        if isinstance(rule, str):
+            return rule, {"column": column}
+        
+        if isinstance(rule, dict):
+            rtype, k = list(rule.items())[0]
+            kwargs = dict(k or {})
+            kwargs['column'] = column
+            return rtype, kwargs
+        
+        return None, None
+
+    def _process_rule(self, validator, file_path, column, rule):
+        """Process a single rule and yield validation results."""
+        rtype, kwargs = self._parse_rule(rule, column)
+        if rtype is None:
+            return
+
+        try:
+            stats = validator.validate(rtype, **kwargs)
+            kw_str = json.dumps(kwargs, sort_keys=True)
+            yield ((file_path, column, rtype, kw_str), stats)
+        except Exception as e:
+            logging.error(f"Rule failed: {rtype} on {column}: {e}")
+            yield ((file_path, column, rtype, "ERROR"), {"total": 0, "failed": 0, "error": str(e)})
+
+    def _process_column_rules(self, validator, file_path, column, rule_list):
+        """Process all rules for a single column."""
+        for rule in rule_list:
+            yield from self._process_rule(validator, file_path, column, rule)
+
+    def process(self, element, rules_yaml):
+        file_path, rg_index = element
+        
+        try:
+            rules_config = yaml.safe_load(rules_yaml)
+            tables = rules_config.get('tables', {})
+            logging.info(f"DIAGNOSTIC: YAML loaded. Found tables: {list(tables.keys())}")
+
+            target_table, columns_config = self._get_target_table_and_columns(tables)
+            if columns_config is None:
+                return
+
+            df = pq.ParquetFile(file_path).read_row_group(rg_index).to_pandas()
+            logging.info(f"DIAGNOSTIC: File: {file_path}")
+            logging.info(f"DIAGNOSTIC: Parquet Columns: {list(df.columns)}")
+            logging.info(f"DIAGNOSTIC: YAML Columns: {list(columns_config.keys())}")
+
+            validator = DataQualityValidator(df)
+            match_count = 0
+
+            for column, rule_list in columns_config.items():
+                if not self._validate_column_exists(column, df.columns):
+                    continue
+
+                match_count += 1
+                yield from self._process_column_rules(validator, file_path, column, rule_list)
+
+            if match_count == 0:
+                logging.error("DIAGNOSTIC CRITICAL: Zero columns matched. Pipeline generated no results.")
+                    
+        except Exception as e:
+            logging.error(f"Worker Crash {file_path}: {e}")
+            yield ((file_path, "UNKNOWN", "CRITICAL ERROR", "ERROR"), {"total": 0, "failed": 0, "error": str(e)})
+
+
+class AggregateStats(beam.CombineFn):
+    def create_accumulator(self):
+        return {"total": 0, "failed": 0, "errors": []}
+
+    def add_input(self, acc, input):
+        if "error" in input:
+            acc["errors"].append(input["error"])
+        else:
+            acc["total"] += input["total"]
+            acc["failed"] += input["failed"]
+        return acc
+
+    def merge_accumulators(self, accs):
+        res = self.create_accumulator()
+        for acc in accs:
+            res["total"] += acc["total"]
+            res["failed"] += acc["failed"]
+            res["errors"].extend(acc["errors"])
+        return res
+
+    def extract_output(self, acc):
+        return acc
+    
+
+def _create_rule_detail(file_name, column, rule_type, total_rows, failed_rows, errors):
+    """Create a rule detail dictionary from parquet file information."""
+    fsplits = file_name.split('_')
+    table_name = fsplits[1]
+    file_load_date = datetime.now().strftime('%Y-%m-%d')
+    pass_count = max(total_rows - failed_rows, 0)
+    failure_rate = (failed_rows / total_rows) if total_rows > 0 else 0.0
+    
+    return {
+        "file_name": file_name.replace('.parquet', ''),
+        "column_name": column,
+        "rule_type": rule_type,
+        "total_count": total_rows,
+        "failed_count": failed_rows,
+        "failed": failure_rate > 0.25,
+        "status": "FAILED" if failed_rows > 0 else "PASSED",
+        "message": "; ".join(errors) if errors else "",
+        "table_name": table_name,
+        "file_load_date": file_load_date,
+        "pass_count": pass_count
+    }
+
+def _update_file_stats_map(file_stats_map, file_path, total_rows, failed_rows):
+    """Update file statistics map with new rule results."""
+    if file_path not in file_stats_map:
+        file_stats_map[file_path] = {
+            "total_rows": 0, 
+            "sum_failures": 0,
+            "rule_count": 0
+        }
+    
+    entry = file_stats_map[file_path]
+    entry['total_rows'] = max(entry['total_rows'], total_rows)
+    entry['sum_failures'] += failed_rows
+    entry['rule_count'] += 1
+
+def _calculate_pass_rate(total, failures, rules):
+    """Calculate pass rate percentage."""
+    if total > 0 and rules > 0:
+        return (1.0 - (failures / (total * rules))) * 100.0
+    return 0.0
+
+def _build_file_stats(file_stats_map):
+    """Build file statistics list from file stats map."""
+    file_stats = []
+    for fname, data in file_stats_map.items():
+        total = data['total_rows']
+        failures = data['sum_failures']
+        rules = data['rule_count']
+        pass_rate = _calculate_pass_rate(total, failures, rules)
+        
+        file_stats.append({
+            "file_name": fname,
+            "total_rows": total,
+            "failed_rows_sum": failures,
+            "rule_count": rules,
+            "pass_rate": round(pass_rate, 2)
+        })
+    return file_stats
+
+def format_for_dag(grouped_results):
+    rule_details = []
+    file_stats_map = {}
+
+    for (file_path, column, rule_type, kw_str), stats in grouped_results:      
+        total_rows = stats['total']
+        failed_rows = stats['failed']
+        errors = stats.get('errors', [])
+        file_name = file_path.split('/')[-1]
+        
+        if file_name.endswith('.parquet'):
+            detail = _create_rule_detail(file_name, column, rule_type, total_rows, failed_rows, errors)
+            rule_details.append(detail)
+
+        _update_file_stats_map(file_stats_map, file_path, total_rows, failed_rows)
+
+    file_stats = _build_file_stats(file_stats_map)
+
+    return {
+        "rule_details": rule_details,
+        "file_stats": file_stats
+    }
+
+def _validate_command_line_arg(value: str, field: str) -> str:
+    if value is None:
+        raise argparse.ArgumentTypeError(f"{field} must be provided")
+    if not isinstance(value, str):
+        raise argparse.ArgumentTypeError(f"{field} must be a string")
+    if any(ch in value for ch in ("\x00", "\n", "\r")):
+        raise argparse.ArgumentTypeError(f"{field} contains invalid control characters")
+    if len(value) > 4096:
+        raise argparse.ArgumentTypeError(f"{field} is unexpectedly long")
+    return value
+
+def _validate_input_pattern(value: str) -> str:
+    return _validate_command_line_arg(value, "input_pattern")
+
+def _validate_rules_yaml(value: str) -> str:
+    return _validate_command_line_arg(value, "rules_yaml")
+
+def _validate_output_stats(value: str) -> str:
+    return _validate_command_line_arg(value, "output_stats")
+
+def _validate_dq_run_id(value: str) -> str:
+    return _validate_command_line_arg(value, "dq_run_id")
+
+def _validate_table_name(value: str) -> str:
+    return _validate_command_line_arg(value, "table_name")
+
+
+def run(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input_pattern', required=True, type=_validate_input_pattern)
+    parser.add_argument('--rules_yaml', required=True, type=_validate_rules_yaml)
+    parser.add_argument('--output_stats', required=True, type=_validate_output_stats)
+    parser.add_argument('--dq_run_id', required=False, type=_validate_dq_run_id)
+    parser.add_argument('--table_name', required=True, type=_validate_table_name)
+    
+    known_args, pipeline_args = parser.parse_known_args(argv)
+    options = PipelineOptions(pipeline_args)
+    options.view_as(beam.options.pipeline_options.SetupOptions).save_main_session = True
+
+    match = FileSystems.match([known_args.rules_yaml], limits=[1])
+    if not match or not match[0].metadata_list:
+        raise FileNotFoundError(f"Rules not found: {known_args.rules_yaml}")
+    
+    with FileSystems.open(match[0].metadata_list[0].path) as f:
+        rules_content = f.read().decode('utf-8')
+    
+    data_matches = FileSystems.match([known_args.input_pattern])
+    total_files_found = 0
+    for m in data_matches:
+        total_files_found += len(m.metadata_list)
+
+    if total_files_found == 0:
+        raise ValueError(f"No datafiles found matching pattern: {known_args.input_pattern}")
+
+    logging.info(f'Starting DQ Pipeline for table {known_args.table_name}. Found {total_files_found} files')
+
+    with beam.Pipeline(options=options) as p:
+        
+        rules_side_input = p | "CreateRules" >> beam.Create([rules_content])
+
+        (
+            p 
+            | "Start" >> beam.Create([known_args.input_pattern])
+            | "ExpandFiles" >> beam.ParDo(ExpandPattern())
+            | "GetSplits" >> beam.ParDo(GetParquetRowGroups())
+            | "Validate" >> beam.ParDo(
+                ValidateRowGroup(table_name_args=known_args.table_name), 
+                rules_yaml=AsSingleton(rules_side_input)
+            )
+            | "Combine" >> beam.CombinePerKey(AggregateStats())
+            | "Format" >> beam.combiners.ToList()
+            | "StructureJSON" >> beam.Map(format_for_dag)
+            | "SerializeJSON" >> beam.Map(lambda x: json.dumps(x, indent=2))
+            | "LogResults" >> beam.Map(lambda x: (logging.info(f"Final DQ Results:\n{json.dumps(x, indent=2)}"), x)[1])
+            | "WriteJSON" >> beam.io.WriteToText(
+                known_args.output_stats, 
+                shard_name_template='', 
+                file_name_suffix='' 
+            )
+        )
+
+
+if __name__ == '__main__':
+    logging.getLogger().setLevel(logging.INFO)
+    run()
